@@ -38,17 +38,45 @@ jobs:
       - name: Show starting status
         run: python percent.py status
 
-      - name: Run pipeline (time-boxed)
+      - name: Run pipeline with periodic checkpoints
         env:
           GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
-        run: |
-          timeout 20700 python percent.py run --min-files 2 --max-files 80 || true
-
-      - name: Show ending status
-        run: python percent.py status
-
-      - name: Upload updated db back to release asset
-        env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python upload_db_release.py --repo ${{ github.repository }} --file github_pipeline.db --tag db-snapshot
+          set +e
+          END=$((SECONDS + 20400))   # ~5h40m total budget
+          CHUNK=2400                # ~40 min per chunk before checkpointing
+
+          while [ $SECONDS -lt $END ]; do
+            REMAINING=$((END - SECONDS))
+            THIS_CHUNK=$CHUNK
+            if [ $REMAINING -lt $CHUNK ]; then
+              THIS_CHUNK=$REMAINING
+            fi
+            if [ $THIS_CHUNK -le 0 ]; then
+              break
+            fi
+
+            echo "=== Running chunk for ${THIS_CHUNK}s ==="
+            timeout $THIS_CHUNK python percent.py run --min-files 2 --max-files 80
+            RC=$?
+            echo "=== Chunk exited with code $RC ==="
+
+            echo "=== Checkpoint: uploading db ==="
+            python upload_db_release.py --repo ${{ github.repository }} --file github_pipeline.db --tag db-snapshot
+            python percent.py status
+
+            # If the run finished on its own (no more pending rows), stop looping
+            if [ $RC -eq 0 ]; then
+              PENDING=$(python -c "
+                import sqlite3
+                c = sqlite3.connect('github_pipeline.db')
+                row = c.execute(\"SELECT COUNT(*) FROM repo_ids WHERE status='pending'\").fetchone()
+                print(row[0])
+                ")
+              if [ "$PENDING" = "0" ]; then
+                echo "No pending rows left. Done."
+                break
+              fi
+            fi
+          done
