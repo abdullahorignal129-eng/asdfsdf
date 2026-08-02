@@ -324,6 +324,14 @@ class RateLimiter:
                 pass
         return False
 
+    @property
+    def reset_at(self) -> float:
+        return self._reset_at
+
+    def is_exhausted(self) -> bool:
+        """True if this token is currently waiting out a rate limit."""
+        return self._reset_at > time.time()
+
 
 async def http_get(
     session: aiohttp.ClientSession,
@@ -494,8 +502,98 @@ def get_part(db: DB, rid: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Async worker
+# Checkpointing (upload db to an HF bucket on a timer, or immediately if
+# several tokens go rate-limited at once)
 # ---------------------------------------------------------------------------
+
+def snapshot_db(db_path: Path) -> Path:
+    """
+    Create a consistent point-in-time copy of the (possibly actively being
+    written) SQLite db using SQLite's own backup API, so a checkpoint
+    upload never reads a half-written file. Safe to call while workers
+    are still writing thanks to WAL mode.
+    """
+    tmp_path = db_path.with_suffix(db_path.suffix + ".checkpoint")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    src = sqlite3.connect(str(db_path))
+    dst = sqlite3.connect(str(tmp_path))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return tmp_path
+
+
+def do_checkpoint_upload(db_path: Path, bucket: str):
+    """Blocking: snapshot the db and upload it to the HF bucket under the
+    real db's filename. Import is local so --bucket is fully optional and
+    nobody without huggingface_hub installed is forced to have it."""
+    from upload_db_bucket import upload_file_to_bucket
+
+    snap = snapshot_db(db_path)
+    try:
+        upload_file_to_bucket(bucket, str(snap), remote_name=db_path.name)
+    finally:
+        try:
+            snap.unlink()
+        except OSError:
+            pass
+
+
+async def checkpoint_scheduler(
+    db_path: Path,
+    bucket: str,
+    limiters: dict,
+    interval_s: int,
+    exhausted_threshold: int,
+    stop_event: asyncio.Event,
+    poll_s: int = 15,
+    exhaustion_cooldown_s: int = 60,
+):
+    """
+    Background task: uploads a checkpoint of the db when EITHER
+      - `interval_s` seconds have passed since the last checkpoint, OR
+      - at least `exhausted_threshold` tokens are currently rate-limited
+        at the same time (checked every `poll_s` seconds), subject to a
+        cooldown so a sustained exhaustion doesn't spam re-uploads.
+    whichever happens first.
+    """
+    last_checkpoint = time.time()
+    last_exhaustion_trigger = 0.0
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=poll_s)
+            break  # stop_event was set -> exit loop, caller does final checkpoint
+        except asyncio.TimeoutError:
+            pass
+
+        now_t = time.time()
+        exhausted = sum(1 for lim in limiters.values() if lim.is_exhausted())
+        due_time = (now_t - last_checkpoint) >= interval_s
+        due_exhaustion = (
+            exhausted >= exhausted_threshold
+            and (now_t - last_exhaustion_trigger) >= exhaustion_cooldown_s
+        )
+
+        if due_time or due_exhaustion:
+            reason = (
+                f"{exhausted}/{len(limiters)} tokens rate-limited"
+                if due_exhaustion and not due_time
+                else "10-min interval"
+            )
+            print(f"[checkpoint] uploading db ({reason})")
+            try:
+                await asyncio.to_thread(do_checkpoint_upload, db_path, bucket)
+                last_checkpoint = time.time()
+                print("[checkpoint] upload complete")
+            except Exception as e:
+                print(f"[checkpoint] upload FAILED: {e}")
+            if due_exhaustion:
+                last_exhaustion_trigger = time.time()
+
 
 async def process_repo_id(rid, session, limiter, sem, db: DB, allow_archived: bool) -> str:
     part = await asyncio.to_thread(get_part, db, rid)
@@ -575,9 +673,12 @@ async def token_worker(
     min_files: int,
     max_files: int | None,
     worker_id: int,
+    limiters: dict | None = None,
 ):
     label = "anon" if not token else f"{token[:4]}...{token[-4:]}"
     limiter = RateLimiter()
+    if limiters is not None:
+        limiters[worker_id] = limiter
     sem = asyncio.Semaphore(PER_TOKEN_CONCURRENCY)
     connector = aiohttp.TCPConnector(limit=PER_TOKEN_CONCURRENCY)
     processed = 0
@@ -627,12 +728,43 @@ async def run_async(args, tokens: list[str]):
     # rows are untouched and the run resumes from where it stopped.
     db.execute("UPDATE repo_ids SET status='pending' WHERE status='in_progress'")
 
-    await asyncio.gather(
-        *(
-            token_worker(tokens[i], db, args.allow_archived, args.min_files, args.max_files, i)
-            for i in range(len(tokens))
+    limiters: dict = {}
+    stop_event = asyncio.Event()
+    checkpoint_task = None
+    if args.bucket:
+        checkpoint_task = asyncio.create_task(
+            checkpoint_scheduler(
+                args.db,
+                args.bucket,
+                limiters,
+                args.checkpoint_interval,
+                args.checkpoint_exhausted,
+                stop_event,
+            )
         )
-    )
+
+    try:
+        await asyncio.gather(
+            *(
+                token_worker(
+                    tokens[i], db, args.allow_archived, args.min_files, args.max_files, i, limiters
+                )
+                for i in range(len(tokens))
+            )
+        )
+    finally:
+        if checkpoint_task:
+            stop_event.set()
+            await checkpoint_task
+            # Always do one final checkpoint at the very end, regardless of
+            # timer/exhaustion state, so a run that finishes early (queue
+            # drained) or gets cut off still uploads its last state.
+            print("[checkpoint] final upload before exit")
+            try:
+                await asyncio.to_thread(do_checkpoint_upload, args.db, args.bucket)
+                print("[checkpoint] final upload complete")
+            except Exception as e:
+                print(f"[checkpoint] final upload FAILED: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +834,20 @@ def main():
     p_run.add_argument("--min-files", type=int, default=2)
     p_run.add_argument("--max-files", type=int, default=80)
     p_run.add_argument("--allow-archived", action="store_true")
+    p_run.add_argument(
+        "--bucket", type=str, default=None,
+        help="HF bucket (namespace/name) to auto-checkpoint the db to, e.g. PERDYPTO/db_snapshot. "
+             "If omitted, no automatic checkpointing happens."
+    )
+    p_run.add_argument(
+        "--checkpoint-interval", type=int, default=600,
+        help="Max seconds between automatic checkpoint uploads (default 600 = 10 min)."
+    )
+    p_run.add_argument(
+        "--checkpoint-exhausted", type=int, default=3,
+        help="Trigger an immediate checkpoint upload as soon as this many tokens are "
+             "simultaneously rate-limited (default 3)."
+    )
 
     sub.add_parser("status")
 
