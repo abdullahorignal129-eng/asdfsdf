@@ -1,0 +1,66 @@
+name: github-metadata-pipeline
+
+on:
+  workflow_dispatch: {}   # manual "Run workflow" button for now
+  # schedule:
+  #   - cron: "0 */6 * * *"   # uncomment later to auto-repeat every 6h
+
+concurrency:
+  group: github-metadata-pipeline
+  cancel-in-progress: false   # never kill a run that's mid-flight
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # ~5h55m of work, leaves buffer before the 6h hard limit
+
+    steps:
+      - name: Checkout repo (script only, db is NOT in git)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp python-dotenv requests huggingface_hub hf_xet
+
+      - name: Download latest db from HF bucket
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python download_db_bucket.py --bucket PERDYPTO/db_snapshot --file github_pipeline.db
+
+      - name: Show starting status
+        run: python percent.py status
+
+      # percent.py now checkpoints itself automatically: every 10 minutes,
+      # OR immediately if 3+ tokens are simultaneously rate-limited,
+      # whichever comes first. It also does a final checkpoint on exit.
+      - name: Run pipeline (self-checkpointing)
+        env:
+          GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          timeout 20400 python percent.py run \
+            --min-files 2 --max-files 80 \
+            --bucket PERDYPTO/db_snapshot \
+            --checkpoint-interval 600 \
+            --checkpoint-exhausted 3 \
+            || true
+
+      - name: Show ending status
+        run: python percent.py status
+
+      # Belt-and-suspenders: one more explicit upload in case the in-process
+      # final checkpoint didn't get to finish before the job was cut off.
+      - name: Final safety-net upload
+        if: always()
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python upload_db_bucket.py --bucket PERDYPTO/db_snapshot --file github_pipeline.db || true
