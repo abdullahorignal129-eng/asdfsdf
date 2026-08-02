@@ -40,7 +40,7 @@ jobs:
 
       - name: Run pipeline (time-boxed)
         env:
-          GITHUB_TOKENS: ${{ secrets.GITHUB_TOKENS }}
+          GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
         run: |
           timeout 20700 python percent.py run --min-files 2 --max-files 80 || true
 
