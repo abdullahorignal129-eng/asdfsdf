@@ -11,6 +11,7 @@ Requires:
 import argparse
 import os
 import sys
+import time
 import requests
 
 API = "https://api.github.com"
@@ -39,7 +40,7 @@ def delete_existing_asset(repo, release, filename, token):
             requests.delete(f"{API}/repos/{repo}/releases/assets/{asset['id']}", headers=headers)
 
 
-def upload_asset(repo, release, filepath, token):
+def upload_asset(repo, release, filepath, token, max_retries=5):
     filename = os.path.basename(filepath)
     delete_existing_asset(repo, release, filename, token)
 
@@ -51,17 +52,33 @@ def upload_asset(repo, release, filepath, token):
     size = os.path.getsize(filepath)
     print(f"Uploading {filepath} ({size / 1e6:.1f} MB) -> {repo} release '{release['tag_name']}'")
 
-    with open(filepath, "rb") as f:
-        r = requests.post(
-            upload_url,
-            headers=headers,
-            params={"name": filename},
-            data=f,
-        )
-    r.raise_for_status()
-    asset = r.json()
-    print(f"Done. Download URL: {asset['browser_download_url']}")
-    return asset["browser_download_url"]
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(filepath, "rb") as f:
+                r = requests.post(
+                    upload_url,
+                    headers=headers,
+                    params={"name": filename},
+                    data=f,
+                    timeout=600,
+                )
+            r.raise_for_status()
+            asset = r.json()
+            print(f"Done. Download URL: {asset['browser_download_url']}")
+            return asset["browser_download_url"]
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            wait = min(2 ** attempt, 60)
+            print(f"Upload attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                print(f"Retrying in {wait}s...")
+                time.sleep(wait)
+                # a partially-created asset from a failed attempt can block
+                # a clean re-upload with the same name, so clear it first
+                delete_existing_asset(repo, release, filename, token)
+
+    raise SystemExit(f"Upload failed after {max_retries} attempts: {last_err}")
 
 
 def main():
