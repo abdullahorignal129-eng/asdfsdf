@@ -1,0 +1,54 @@
+name: github-metadata-pipeline
+
+on:
+  workflow_dispatch: {}   # manual "Run workflow" button for now
+  # schedule:
+  #   - cron: "0 */6 * * *"   # uncomment later to auto-repeat every 6h
+
+concurrency:
+  group: github-metadata-pipeline
+  cancel-in-progress: false   # never kill a run that's mid-flight
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # ~5h55m of work, leaves buffer before the 6h hard limit
+
+    steps:
+      - name: Checkout repo (script only, db is NOT in git)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp python-dotenv requests
+
+      - name: Download latest db from release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python download_db_release.py --repo ${{ github.repository }} --file github_pipeline.db --tag db-snapshot
+
+      - name: Show starting status
+        run: python percent.py status
+
+      - name: Run pipeline (time-boxed)
+        env:
+          GITHUB_TOKENS: ${{ secrets.GITHUB_TOKENS }}
+        run: |
+          timeout 20700 python percent.py run --min-files 2 --max-files 80 || true
+
+      - name: Show ending status
+        run: python percent.py status
+
+      - name: Upload updated db back to release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python upload_db_release.py --repo ${{ github.repository }} --file github_pipeline.db --tag db-snapshot
