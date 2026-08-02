@@ -18,6 +18,40 @@ import sys
 
 from huggingface_hub import login, create_bucket, batch_bucket_files
 
+_logged_in_token = None  # avoid re-calling login() on every checkpoint upload
+
+
+def upload_file_to_bucket(bucket: str, file: str, remote_name: str | None = None, token: str | None = None) -> str:
+    """
+    Upload `file` to the given HF bucket (namespace/name) under `remote_name`
+    (defaults to the local file's basename). Creates the bucket if it
+    doesn't exist yet. Returns the hf:// URI of the uploaded file.
+
+    Importable so other scripts (e.g. the pipeline's own checkpointing)
+    can call this directly instead of shelling out.
+    """
+    global _logged_in_token
+    token = token or os.environ.get("HF_TOKEN")
+    if not token:
+        raise RuntimeError("Set HF_TOKEN env var or pass token= explicitly")
+    if not os.path.exists(file):
+        raise FileNotFoundError(f"File not found: {file}")
+
+    if _logged_in_token != token:
+        login(token=token, add_to_git_credential=False)
+        _logged_in_token = token
+
+    remote_name = remote_name or os.path.basename(file)
+    size_mb = os.path.getsize(file) / 1e6
+    print(f"Uploading {file} ({size_mb:.1f} MB) -> hf://buckets/{bucket}/{remote_name}")
+
+    create_bucket(bucket, exist_ok=True)
+    batch_bucket_files(bucket, add=[(file, remote_name)])
+
+    uri = f"hf://buckets/{bucket}/{remote_name}"
+    print(f"Done. {uri}")
+    return uri
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -27,22 +61,7 @@ def main():
     ap.add_argument("--token", default=os.environ.get("HF_TOKEN"))
     args = ap.parse_args()
 
-    if not args.token:
-        sys.exit("Set HF_TOKEN env var or pass --token")
-    if not os.path.exists(args.file):
-        sys.exit(f"File not found: {args.file}")
-
-    login(token=args.token, add_to_git_credential=False)
-
-    remote_name = args.remote_name or os.path.basename(args.file)
-    size_mb = os.path.getsize(args.file) / 1e6
-    print(f"Uploading {args.file} ({size_mb:.1f} MB) -> hf://buckets/{args.bucket}/{remote_name}")
-
-    # exist_ok=True: safe to call every run, no-op if the bucket already exists
-    create_bucket(args.bucket, exist_ok=True)
-
-    batch_bucket_files(args.bucket, add=[(args.file, remote_name)])
-    print(f"Done. hf://buckets/{args.bucket}/{remote_name}")
+    upload_file_to_bucket(args.bucket, args.file, remote_name=args.remote_name, token=args.token)
 
 
 if __name__ == "__main__":
