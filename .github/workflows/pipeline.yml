@@ -1,18 +1,18 @@
 name: github-metadata-pipeline
 
 on:
-  workflow_dispatch: {}   # manual "Run workflow" button for now
-  # schedule:
-  #   - cron: "0 */6 * * *"   # uncomment later to auto-repeat every 6h
+  workflow_dispatch: {}          # manual "Run workflow" button, still available
+  schedule:
+    - cron: "0 */6 * * *"        # runs itself automatically every 6 hours
 
 concurrency:
   group: github-metadata-pipeline
-  cancel-in-progress: false   # never kill a run that's mid-flight
+  cancel-in-progress: false      # never kill a run that's mid-flight
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # ~5h55m of work, leaves buffer before the 6h hard limit
+    timeout-minutes: 355         # ~5h55m of work, leaves buffer before the 6h hard limit
 
     steps:
       - name: Checkout repo (script only, db is NOT in git)
@@ -27,7 +27,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install aiohttp python-dotenv requests huggingface_hub hf_xet
+          pip install aiohttp python-dotenv requests huggingface_hub hf_xet pyarrow
 
       - name: Download latest db from HF bucket
         env:
@@ -38,10 +38,16 @@ jobs:
       - name: Show starting status
         run: python percent.py status
 
-      # percent.py now checkpoints itself automatically: every 10 minutes,
-      # OR immediately if 3+ tokens are simultaneously rate-limited,
-      # whichever comes first. It also does a final checkpoint on exit.
-      - name: Run pipeline (self-checkpointing)
+      # percent.py now does three things concurrently in this one command:
+      #  1) scrapes pending repo_ids (10 tokens, 3 concurrent req/token)
+      #  2) auto-ingests the next not-yet-ingested parquet part(s) in the
+      #     background, discovering the full part list itself, and reports
+      #     how many repo_ids were new vs already in the db per part
+      #  3) checkpoints the db to the HF bucket every 10 min, or sooner if
+      #     3+ tokens are simultaneously rate-limited
+      # Scraping keeps going until BOTH the queue is empty AND ingestion has
+      # confirmed there are no more parquet parts left anywhere.
+      - name: Run pipeline (self-checkpointing, self-ingesting)
         env:
           GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
