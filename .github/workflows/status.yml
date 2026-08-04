@@ -1,48 +1,71 @@
-- name: Read SQLite stats
-  run: |
-    python <<'PY'
-    import sqlite3
+name: SQLite Status
 
-    conn = sqlite3.connect("github_pipeline.db")
-    cur = conn.cursor()
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *" # every hour
 
-    print("=== repo_ids ===")
-    for status, count in cur.execute("""
-        SELECT status, COUNT(*)
-        FROM repo_ids
-        GROUP BY status
-        ORDER BY count(*) DESC
-    """):
-        print(f"{status}: {count}")
+jobs:
+  status:
+    runs-on: ubuntu-latest
 
-    metadata = cur.execute(
-        "SELECT COUNT(*) FROM metadata"
-    ).fetchone()[0]
+    steps:
+      - uses: actions/checkout@v4
 
-    forks = cur.execute(
-        "SELECT COUNT(*) FROM forks"
-    ).fetchone()[0]
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-    print(f"\n=== metadata (canonical): {metadata} ===")
-    print(f"=== forks logged: {forks} ===")
+      - name: Install dependencies
+        run: |
+          pip install huggingface_hub
 
-    done, new_ids, already = cur.execute("""
-        SELECT
-            COUNT(*),
-            COALESCE(SUM(new_ids),0),
-            COALESCE(SUM(already_present),0)
-        FROM parquet_progress
-        WHERE status='done'
-    """).fetchone()
+      - name: Download SQLite DB
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python <<'PY'
+          from huggingface_hub import hf_hub_download
 
-    print(f"=== parquet ingestion: {done} part(s) done | total new_ids={new_ids} already_present={already} ===")
+          hf_hub_download(
+              repo_id="PERDYPTO/db_snapshot",   # change this
+              filename="github_pipeline.db",    # change if needed
+              repo_type="dataset",
+              token="${HF_TOKEN}",
+              local_dir="."
+          )
+          PY
 
-    print("\nTop python_pct:")
-    for row in cur.execute("""
-        SELECT full_name, python_pct
-        FROM metadata
-        ORDER BY python_pct DESC
-        LIMIT 15
-    """):
-        print(row)
-    PY
+      - name: Run status
+        run: |
+          python scripts/github_pipeline_sqlite.py \
+            --db github_pipeline.db status > status.txt
+
+      - name: Extract summary
+        run: |
+          python <<'PY'
+          import re
+
+          text = open("status.txt").read()
+
+          wanted = [
+              "=== repo_ids ===",
+              "=== metadata",
+              "=== forks",
+              "=== parquet ingestion",
+              "Top python_pct:"
+          ]
+
+          printing = False
+          for line in text.splitlines():
+              if any(line.startswith(x) for x in wanted):
+                  printing = True
+              if printing:
+                  print(line)
+          PY
+
+      - name: Upload full status
+        uses: actions/upload-artifact@v4
+        with:
+          name: status
+          path: status.txt
