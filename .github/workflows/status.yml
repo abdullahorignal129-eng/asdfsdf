@@ -29,4 +29,4 @@ jobs:
 
       - name: Print status
         run: |
-          python rpercent.py --db github_pipeline.db status
+          python percent.py --db github_pipeline.db status
