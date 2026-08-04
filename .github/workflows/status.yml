@@ -1,0 +1,48 @@
+- name: Read SQLite stats
+  run: |
+    python <<'PY'
+    import sqlite3
+
+    conn = sqlite3.connect("github_pipeline.db")
+    cur = conn.cursor()
+
+    print("=== repo_ids ===")
+    for status, count in cur.execute("""
+        SELECT status, COUNT(*)
+        FROM repo_ids
+        GROUP BY status
+        ORDER BY count(*) DESC
+    """):
+        print(f"{status}: {count}")
+
+    metadata = cur.execute(
+        "SELECT COUNT(*) FROM metadata"
+    ).fetchone()[0]
+
+    forks = cur.execute(
+        "SELECT COUNT(*) FROM forks"
+    ).fetchone()[0]
+
+    print(f"\n=== metadata (canonical): {metadata} ===")
+    print(f"=== forks logged: {forks} ===")
+
+    done, new_ids, already = cur.execute("""
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(new_ids),0),
+            COALESCE(SUM(already_present),0)
+        FROM parquet_progress
+        WHERE status='done'
+    """).fetchone()
+
+    print(f"=== parquet ingestion: {done} part(s) done | total new_ids={new_ids} already_present={already} ===")
+
+    print("\nTop python_pct:")
+    for row in cur.execute("""
+        SELECT full_name, python_pct
+        FROM metadata
+        ORDER BY python_pct DESC
+        LIMIT 15
+    """):
+        print(row)
+    PY
