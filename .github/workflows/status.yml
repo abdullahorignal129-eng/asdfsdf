@@ -38,7 +38,7 @@ jobs:
 
       - name: Run status
         run: |
-          python scripts/github_pipeline_sqlite.py \
+          python percent.py \
             --db github_pipeline.db status > status.txt
 
       - name: Extract summary
