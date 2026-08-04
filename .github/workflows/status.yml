@@ -1,4 +1,4 @@
-name: Status
+name: Database Status
 
 on:
   workflow_dispatch:
@@ -14,21 +14,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
+      - name: Install huggingface_hub
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install huggingface_hub
 
       - name: Download database
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python <<'PY'
-          import urllib.request
-
-          urllib.request.urlretrieve(
-              "https://huggingface.co/buckets/PERDYPTO/db_snapshot/resolve/github_pipeline.db?download=true",
-              "github_pipeline.db"
-          )
-          PY
+          python download_db_bucket.py \
+            --bucket PERDYPTO/db_snapshot \
+            --file github_pipeline.db
 
       - name: Print status
         run: |
