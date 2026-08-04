@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -160,6 +161,18 @@ CREATE TABLE IF NOT EXISTS forks (
     updated_at             TEXT
 );
 
+CREATE TABLE IF NOT EXISTS parquet_progress (
+    part               INTEGER PRIMARY KEY,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    -- pending | done | error
+    total_ids_in_part  INTEGER,
+    new_ids            INTEGER,
+    already_present    INTEGER,
+    rows_scanned       INTEGER,
+    last_error         TEXT,
+    ingested_at        TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_repo_ids_status ON repo_ids(status);
 CREATE INDEX IF NOT EXISTS idx_metadata_python_pct ON metadata(python_pct DESC);
 """
@@ -228,21 +241,57 @@ def now() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Ingest parquet -> repo_ids  (unchanged, still sync/one-shot)
+# Ingest parquet -> repo_ids
 # ---------------------------------------------------------------------------
 
-def cmd_ingest(args):
-    if pq is None:
-        raise SystemExit("pip install pyarrow")
+def discover_available_parts(repo: str = REPO) -> list[int]:
+    """
+    List the actual parquet files under language=Python/ in the source HF
+    bucket and extract their part numbers. This avoids hardcoding a total
+    part count -- auto-ingest always knows the real, current list of parts,
+    however many there are.
+    """
+    from huggingface_hub import login, list_bucket_tree
 
-    db = DB(args.db)
-    rel = args.file or PART_FMT.format(part=args.part)
+    token = os.environ.get("HF_TOKEN")
+    if token:
+        try:
+            login(token=token, add_to_git_credential=False)
+        except Exception:
+            pass  # non-fatal; listing may still work if already logged in
+
+    pattern = re.compile(r"part-(\d{5})-")
+    parts: set[int] = set()
+    try:
+        for item in list_bucket_tree(repo, prefix="language=Python/"):
+            if getattr(item, "type", None) == "file":
+                m = pattern.search(item.path)
+                if m:
+                    parts.add(int(m.group(1)))
+    except Exception as e:
+        print(f"[ingest] could not list bucket '{repo}' to discover parts: {e}")
+    return sorted(parts)
+
+
+def _ingest_part_core(db: DB, part: int, min_files: int, max_files: int | None, file_override: str | None = None) -> dict:
+    """
+    Core ingest logic for ONE parquet part. Scans it, inserts any repo_ids
+    not already in repo_ids (existing rows are left completely untouched --
+    their status/progress is never reset), reports how many were new vs
+    already present, immediately applies the min/max file-count filter to
+    the newly inserted rows, and records the outcome in parquet_progress.
+    Reusable by both the CLI `ingest` command and the background
+    auto-ingest worker that runs alongside scraping.
+    """
+    if pq is None:
+        raise RuntimeError("pyarrow not installed -- pip install pyarrow")
+
+    rel = file_override or PART_FMT.format(part=part)
     uri = f"hf://buckets/{REPO}/{rel}"
-    print(f"Scanning {uri}")
+    print(f"[ingest] part {part}: scanning {uri}")
 
     pf = pq.ParquetFile(uri)
     counts: dict[int, list[int]] = {}  # rid -> [file_count, bytes]
-
     total_rows = 0
     for rg in range(pf.metadata.num_row_groups):
         table = pf.read_row_group(rg, columns=["size_bytes", "repo_ids"])
@@ -255,17 +304,34 @@ def cmd_ingest(args):
                     counts[rid] = [0, 0]
                 counts[rid][0] += 1
                 counts[rid][1] += size
-        print(f"  row_group {rg + 1}/{pf.metadata.num_row_groups}  rows~{total_rows:,}  ids~{len(counts):,}")
 
-    rows = [(rid, fc, b, "pending", None, now()) for rid, (fc, b) in counts.items()]
+    all_ids = list(counts.keys())
+
+    # Which of these repo_ids already existed BEFORE this ingest? Chunked
+    # IN-queries to stay well under SQLite's default variable limit.
+    already_present_ids: set[int] = set()
+    CHUNK = 900
+    for i in range(0, len(all_ids), CHUNK):
+        chunk = all_ids[i:i + CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        rows = db.query(f"SELECT repo_id FROM repo_ids WHERE repo_id IN ({placeholders})", chunk)
+        already_present_ids.update(r["repo_id"] for r in rows)
+
+    new_count = len(all_ids) - len(already_present_ids)
+    already_count = len(already_present_ids)
+
+    # INSERT OR IGNORE -> existing rows (and their status/progress) are
+    # never touched or reset by re-ingesting a part.
     db.executemany(
         """
         INSERT OR IGNORE INTO repo_ids
         (repo_id, file_count_part, bytes_part, status, last_error, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        rows,
+        [(rid, fc, b, "pending", None, now()) for rid, (fc, b) in counts.items()],
     )
+    # Keep file_count_part/bytes_part current even for ids that already
+    # existed (harmless -- status/progress fields are untouched by this).
     db.executemany(
         """
         UPDATE repo_ids
@@ -274,7 +340,83 @@ def cmd_ingest(args):
         """,
         [(fc, b, now(), rid) for rid, (fc, b) in counts.items()],
     )
-    print(f"Ingested/updated {len(counts):,} distinct repo_ids  (rows scanned {total_rows:,})")
+
+    # Apply the min/max file-count filter immediately so newly ingested
+    # rows don't sit around eligible for scraping outside the range.
+    db.execute(
+        "UPDATE repo_ids SET status='skipped_filter', updated_at=? WHERE status='pending' AND file_count_part < ?",
+        (now(), min_files),
+    )
+    if max_files is not None:
+        db.execute(
+            "UPDATE repo_ids SET status='skipped_filter', updated_at=? WHERE status='pending' AND file_count_part > ?",
+            (now(), max_files),
+        )
+
+    db.execute(
+        """
+        INSERT OR REPLACE INTO parquet_progress
+        (part, status, total_ids_in_part, new_ids, already_present, rows_scanned, last_error, ingested_at)
+        VALUES (?, 'done', ?, ?, ?, ?, NULL, ?)
+        """,
+        (part, len(all_ids), new_count, already_count, total_rows, now()),
+    )
+
+    print(
+        f"[ingest] part {part}: {len(all_ids):,} repo_ids total "
+        f"-> {new_count:,} NEW, {already_count:,} already in db "
+        f"(rows scanned {total_rows:,})"
+    )
+
+    return {
+        "part": part,
+        "total_ids": len(all_ids),
+        "new_ids": new_count,
+        "already_present": already_count,
+        "rows_scanned": total_rows,
+    }
+
+
+def cmd_ingest(args):
+    if pq is None:
+        raise SystemExit("pip install pyarrow")
+
+    db = DB(args.db)
+    _ingest_part_core(db, args.part, args.min_files, args.max_files, file_override=args.file)
+    cmd_status(args)
+
+
+def cmd_ingest_all(args):
+    """
+    Ingest every remaining parquet part sequentially (blocking, no
+    scraping) until none are left. Mostly useful for a one-off manual
+    backfill; the `run` command's auto-ingest does this concurrently
+    with scraping instead, which is what you want for normal operation.
+    """
+    if pq is None:
+        raise SystemExit("pip install pyarrow")
+
+    db = DB(args.db)
+    all_parts = discover_available_parts()
+    if not all_parts:
+        print("No parquet parts discovered -- nothing to ingest.")
+        return
+    print(f"Discovered {len(all_parts)} parquet part(s): {all_parts[0]}..{all_parts[-1]}")
+
+    done_parts = {r["part"] for r in db.query("SELECT part FROM parquet_progress WHERE status='done'")}
+    pending_parts = [p for p in all_parts if p not in done_parts]
+    print(f"{len(done_parts)} already ingested, {len(pending_parts)} remaining")
+
+    for part in pending_parts:
+        try:
+            _ingest_part_core(db, part, args.min_files, args.max_files)
+        except Exception as e:
+            print(f"[ingest] part {part} FAILED: {e}")
+            db.execute(
+                "INSERT OR REPLACE INTO parquet_progress (part, status, last_error, ingested_at) VALUES (?, 'error', ?, ?)",
+                (part, str(e)[:500], now()),
+            )
+
     cmd_status(args)
 
 
@@ -674,6 +816,7 @@ async def token_worker(
     max_files: int | None,
     worker_id: int,
     limiters: dict | None = None,
+    ingest_done_event: asyncio.Event | None = None,
 ):
     label = "anon" if not token else f"{token[:4]}...{token[-4:]}"
     limiter = RateLimiter()
@@ -687,7 +830,15 @@ async def token_worker(
         while True:
             ids = await asyncio.to_thread(db.claim_batch, CLAIM_BATCH_SIZE, min_files, max_files)
             if not ids:
-                break
+                # Queue is momentarily empty. If auto-ingest is still
+                # running (or hasn't started), more rows may show up any
+                # moment -- wait and re-check instead of exiting. Only
+                # stop for good once ingestion has confirmed there's
+                # nothing left to add.
+                if ingest_done_event is None or ingest_done_event.is_set():
+                    break
+                await asyncio.sleep(15)
+                continue
 
             async def run_one(rid):
                 nonlocal processed
@@ -703,6 +854,66 @@ async def token_worker(
             await asyncio.gather(*(run_one(rid) for rid in ids))
 
     print(f"[w{worker_id}:{label}] finished, processed={processed}")
+
+
+async def ingest_worker(
+    db: DB,
+    min_files: int,
+    max_files: int | None,
+    ingest_done_event: asyncio.Event,
+    stop_event: asyncio.Event,
+):
+    """
+    Runs alongside the scraping token_workers. Discovers every available
+    parquet part once, then ingests whichever ones aren't marked 'done' in
+    parquet_progress yet, one at a time, until either none are left or
+    the run is being shut down. Sets ingest_done_event when there's
+    nothing left to ingest, which lets idle token_workers know it's safe
+    to exit once the queue is truly empty (not just momentarily empty).
+    """
+    if pq is None:
+        print("[ingest] pyarrow not installed -- auto-ingest disabled for this run")
+        ingest_done_event.set()
+        return
+
+    all_parts = await asyncio.to_thread(discover_available_parts)
+    if not all_parts:
+        print("[ingest] no parquet parts discovered -- auto-ingest has nothing to do")
+        ingest_done_event.set()
+        return
+    print(f"[ingest] discovered {len(all_parts)} parquet part(s): {all_parts[0]}..{all_parts[-1]}")
+
+    while not stop_event.is_set():
+        done_parts = {
+            r["part"] for r in db.query("SELECT part FROM parquet_progress WHERE status='done'")
+        }
+        remaining = [p for p in all_parts if p not in done_parts]
+        if not remaining:
+            print("[ingest] all discovered parquet parts have been ingested")
+            ingest_done_event.set()
+            return
+
+        part = remaining[0]
+        try:
+            await asyncio.to_thread(_ingest_part_core, db, part, min_files, max_files)
+        except Exception as e:
+            print(f"[ingest] part {part} FAILED: {e}")
+            await asyncio.to_thread(
+                db.execute,
+                "INSERT OR REPLACE INTO parquet_progress (part, status, last_error, ingested_at) VALUES (?, 'error', ?, ?)",
+                (part, str(e)[:500], now()),
+            )
+        # brief pause between parts so this doesn't hammer the HF bucket,
+        # and to give stop_event a chance to interrupt promptly
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=2)
+            return
+        except asyncio.TimeoutError:
+            continue
+
+    ingest_done_event.set()
+
+
 
 
 async def run_async(args, tokens: list[str]):
@@ -730,6 +941,7 @@ async def run_async(args, tokens: list[str]):
 
     limiters: dict = {}
     stop_event = asyncio.Event()
+    ingest_done_event = asyncio.Event()
     checkpoint_task = None
     if args.bucket:
         checkpoint_task = asyncio.create_task(
@@ -743,18 +955,30 @@ async def run_async(args, tokens: list[str]):
             )
         )
 
+    ingest_task = None
+    if args.no_auto_ingest:
+        ingest_done_event.set()  # nothing will be added; workers can exit normally when empty
+        print("[ingest] auto-ingest disabled (--no-auto-ingest)")
+    else:
+        ingest_task = asyncio.create_task(
+            ingest_worker(db, args.min_files, args.max_files, ingest_done_event, stop_event)
+        )
+
     try:
         await asyncio.gather(
             *(
                 token_worker(
-                    tokens[i], db, args.allow_archived, args.min_files, args.max_files, i, limiters
+                    tokens[i], db, args.allow_archived, args.min_files, args.max_files, i,
+                    limiters, ingest_done_event,
                 )
                 for i in range(len(tokens))
             )
         )
     finally:
+        stop_event.set()
+        if ingest_task:
+            await ingest_task
         if checkpoint_task:
-            stop_event.set()
             await checkpoint_task
             # Always do one final checkpoint at the very end, regardless of
             # timer/exhaustion state, so a run that finishes early (queue
@@ -795,6 +1019,23 @@ def cmd_status(args):
     f = db.query_one("SELECT COUNT(*) AS c FROM forks")
     print(f"=== metadata (canonical): {m['c']} ===")
     print(f"=== forks logged: {f['c']} ===")
+
+    parts_done = db.query_one("SELECT COUNT(*) AS c FROM parquet_progress WHERE status='done'")["c"]
+    parts_error = db.query_one("SELECT COUNT(*) AS c FROM parquet_progress WHERE status='error'")["c"]
+    sums = db.query_one(
+        "SELECT COALESCE(SUM(new_ids),0) AS new_ids, COALESCE(SUM(already_present),0) AS already "
+        "FROM parquet_progress WHERE status='done'"
+    )
+    print(
+        f"=== parquet ingestion: {parts_done} part(s) done"
+        + (f", {parts_error} error" if parts_error else "")
+        + f" | total new_ids={sums['new_ids']:,} already_present={sums['already']:,} ==="
+    )
+    if parts_error:
+        print("  Parts with errors:")
+        for row in db.query("SELECT part, last_error FROM parquet_progress WHERE status='error' ORDER BY part"):
+            print(f"    part {row['part']}: {row['last_error']}")
+
     print("Top python_pct:")
     for row in db.query(
         "SELECT repo_id, full_name, python_pct, stars, size_kb FROM metadata "
@@ -826,9 +1067,18 @@ def main():
     ap.add_argument("--db", type=Path, default=DEFAULT_DB)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p_ing = sub.add_parser("ingest", help="Parquet -> repo_ids table")
+    p_ing = sub.add_parser("ingest", help="Parquet -> repo_ids table (one specific part)")
     p_ing.add_argument("--part", type=int, default=0)
     p_ing.add_argument("--file", type=str, default=None)
+    p_ing.add_argument("--min-files", type=int, default=2)
+    p_ing.add_argument("--max-files", type=int, default=80)
+
+    p_ing_all = sub.add_parser(
+        "ingest-all",
+        help="Discover and ingest every remaining parquet part, sequentially, no scraping (one-off backfill)."
+    )
+    p_ing_all.add_argument("--min-files", type=int, default=2)
+    p_ing_all.add_argument("--max-files", type=int, default=80)
 
     p_run = sub.add_parser("run", help="Async concurrent GitHub fetch")
     p_run.add_argument("--min-files", type=int, default=2)
@@ -848,6 +1098,11 @@ def main():
         help="Trigger an immediate checkpoint upload as soon as this many tokens are "
              "simultaneously rate-limited (default 3)."
     )
+    p_run.add_argument(
+        "--no-auto-ingest", action="store_true",
+        help="Disable the background task that discovers and ingests remaining parquet "
+             "parts WHILE scraping runs (auto-ingest is ON by default)."
+    )
 
     sub.add_parser("status")
 
@@ -857,6 +1112,8 @@ def main():
     args = ap.parse_args()
     if args.cmd == "ingest":
         cmd_ingest(args)
+    elif args.cmd == "ingest-all":
+        cmd_ingest_all(args)
     elif args.cmd == "run":
         cmd_run(args)
     elif args.cmd == "status":
