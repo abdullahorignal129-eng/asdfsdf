@@ -1,0 +1,70 @@
+name: emergency-db-recovery
+
+on:
+  workflow_dispatch: {}          # Click "Run workflow" manually to trigger recovery
+
+jobs:
+  repair-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp python-dotenv requests huggingface_hub hf_xet pyarrow
+          sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Download corrupted db from HF bucket
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python download_db_bucket.py --bucket PERDYPTO/db_snapshot --file github_pipeline.db
+
+      - name: Attempt SQLite Recovery
+        run: |
+          echo "=== Starting Database Recovery Process ==="
+          
+          # Backup the corrupted file just in case
+          cp github_pipeline.db corrupted_backup.db
+          
+          # Force SQLite to parse and extract all clean data parts 
+          sqlite3 github_pipeline.db ".recover" > repair_script.sql
+          
+          # Check if the text script contains data or if it failed
+          if [ ! -s repair_script.sql ]; then
+            echo "Warning: .recover produced an empty file. Trying fallback .dump method..."
+            sqlite3 github_pipeline.db ".mode insert" ".dump" > repair_script.sql
+          fi
+
+          # Remove the old malformed database
+          rm -f github_pipeline.db
+          
+          # Rebuild a clean database binary structure from the script
+          sqlite3 github_pipeline.db < repair_script.sql
+          echo "=== Database Recovery Step Completed ==="
+
+      - name: Verify Rebuilt Database Integrity
+        run: |
+          echo "=== Verifying Integrity ==="
+          # This will output 'ok' if structural integrity is restored
+          sqlite3 github_pipeline.db "PRAGMA integrity_check;"
+          
+          echo "=== testing application query ==="
+          # Check if percent.py can read the schema status without throwing malformed errors
+          python percent.py status
+
+      - name: Upload Repaired Database to HF bucket
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python upload_db_bucket.py --bucket PERDYPTO/db_snapshot --file github_pipeline.db
