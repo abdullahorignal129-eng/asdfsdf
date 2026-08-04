@@ -1,71 +1,70 @@
-name: SQLite Status
+name: Check SQLite Status
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 * * * *" # every hour
 
 jobs:
   status:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
+      - name: Install SQLite
         run: |
-          pip install huggingface_hub
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 curl
 
-      - name: Download SQLite DB
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: Download database
         run: |
-          python <<'PY'
-          from huggingface_hub import hf_hub_download
+          curl -L \
+            "https://huggingface.co/buckets/PERDYPTO/db_snapshot/resolve/main/github_pipeline.db" \
+            -o github_pipeline.db
 
-          hf_hub_download(
-              repo_id="PERDYPTO/db_snapshot",   # change this
-              filename="github_pipeline.db",    # change if needed
-              repo_type="dataset",
-              token="${HF_TOKEN}",
-              local_dir="."
-          )
-          PY
+          ls -lh github_pipeline.db
 
-      - name: Run status
+      - name: Print Status
         run: |
-          python percent.py \
-            --db github_pipeline.db status > status.txt
+          echo "=== repo_ids ==="
+          sqlite3 github_pipeline.db "
+          SELECT status || ': ' || COUNT(*)
+          FROM repo_ids
+          GROUP BY status
+          ORDER BY COUNT(*) DESC;
+          "
 
-      - name: Extract summary
-        run: |
-          python <<'PY'
-          import re
+          echo
+          echo "=== metadata (canonical) ==="
+          sqlite3 github_pipeline.db "
+          SELECT COUNT(*) FROM metadata;
+          "
 
-          text = open("status.txt").read()
+          echo
+          echo "=== forks logged ==="
+          sqlite3 github_pipeline.db "
+          SELECT COUNT(*) FROM forks;
+          "
 
-          wanted = [
-              "=== repo_ids ===",
-              "=== metadata",
-              "=== forks",
-              "=== parquet ingestion",
-              "Top python_pct:"
-          ]
+          echo
+          echo "=== parquet ingestion ==="
+          sqlite3 github_pipeline.db "
+          SELECT
+            COUNT(*) || ' part(s) done | total new_ids=' ||
+            COALESCE(SUM(new_ids),0) ||
+            ' already_present=' ||
+            COALESCE(SUM(already_present),0)
+          FROM parquet_progress
+          WHERE status='done';
+          "
 
-          printing = False
-          for line in text.splitlines():
-              if any(line.startswith(x) for x in wanted):
-                  printing = True
-              if printing:
-                  print(line)
-          PY
-
-      - name: Upload full status
-        uses: actions/upload-artifact@v4
-        with:
-          name: status
-          path: status.txt
+          echo
+          echo "Top python_pct:"
+          sqlite3 -header -column github_pipeline.db "
+          SELECT
+            repo_id,
+            full_name,
+            ROUND(python_pct,2) AS python_pct,
+            stars,
+            size_kb
+          FROM metadata
+          ORDER BY python_pct DESC, stars DESC
+          LIMIT 15;
+          "
