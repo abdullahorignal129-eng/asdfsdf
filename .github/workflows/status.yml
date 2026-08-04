@@ -1,4 +1,4 @@
-name: Check SQLite Status
+name: Status
 
 on:
   workflow_dispatch:
@@ -8,63 +8,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install SQLite
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3 curl
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Download database
         run: |
-          curl -L \
-            "https://huggingface.co/buckets/PERDYPTO/db_snapshot/resolve/main/github_pipeline.db" \
-            -o github_pipeline.db
+          python <<'PY'
+          import urllib.request
 
-          ls -lh github_pipeline.db
+          urllib.request.urlretrieve(
+              "https://huggingface.co/buckets/PERDYPTO/db_snapshot/resolve/github_pipeline.db?download=true",
+              "github_pipeline.db"
+          )
+          PY
 
-      - name: Print Status
+      - name: Print status
         run: |
-          echo "=== repo_ids ==="
-          sqlite3 github_pipeline.db "
-          SELECT status || ': ' || COUNT(*)
-          FROM repo_ids
-          GROUP BY status
-          ORDER BY COUNT(*) DESC;
-          "
-
-          echo
-          echo "=== metadata (canonical) ==="
-          sqlite3 github_pipeline.db "
-          SELECT COUNT(*) FROM metadata;
-          "
-
-          echo
-          echo "=== forks logged ==="
-          sqlite3 github_pipeline.db "
-          SELECT COUNT(*) FROM forks;
-          "
-
-          echo
-          echo "=== parquet ingestion ==="
-          sqlite3 github_pipeline.db "
-          SELECT
-            COUNT(*) || ' part(s) done | total new_ids=' ||
-            COALESCE(SUM(new_ids),0) ||
-            ' already_present=' ||
-            COALESCE(SUM(already_present),0)
-          FROM parquet_progress
-          WHERE status='done';
-          "
-
-          echo
-          echo "Top python_pct:"
-          sqlite3 -header -column github_pipeline.db "
-          SELECT
-            repo_id,
-            full_name,
-            ROUND(python_pct,2) AS python_pct,
-            stars,
-            size_kb
-          FROM metadata
-          ORDER BY python_pct DESC, stars DESC
-          LIMIT 15;
-          "
+          python rpercent.py --db github_pipeline.db status
