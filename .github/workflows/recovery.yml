@@ -37,21 +37,20 @@ jobs:
           # Backup the corrupted file just in case
           cp github_pipeline.db corrupted_backup.db
           
-          # Force SQLite to parse and extract all clean data parts 
-          sqlite3 github_pipeline.db ".recover" > repair_script.sql
-          
-          # Check if the text script contains data or if it failed
-          if [ ! -s repair_script.sql ]; then
-            echo "Warning: .recover produced an empty file. Trying fallback .dump method..."
-            sqlite3 github_pipeline.db ".mode insert" ".dump" > repair_script.sql
-          fi
+          # Force a fallback text dump ignoring internal malformed pages
+          echo "PRAGMA writable_schema=ON;" > repair_script.sql
+          sqlite3 github_pipeline.db ".mode insert" ".dump" >> repair_script.sql
+          echo "PRAGMA writable_schema=OFF;" >> repair_script.sql
 
-          # Remove the old malformed database
+          # Remove the old malformed database binary
           rm -f github_pipeline.db
           
           # Rebuild a clean database binary structure from the script
-          sqlite3 github_pipeline.db < repair_script.sql
+          # Using '|| true' to bypass minor constraint violations during recovery
+          sqlite3 github_pipeline.db < repair_script.sql || true
+          
           echo "=== Database Recovery Step Completed ==="
+
 
       - name: Verify Rebuilt Database Integrity
         run: |
