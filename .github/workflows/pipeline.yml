@@ -2,8 +2,8 @@ name: github-metadata-pipeline
 
 on:
   workflow_dispatch: {}          # manual "Run workflow" button, still available
-  schedule:
-    - cron: "13 */6 * * *"        # runs itself automatically every 6 hours
+  # schedule:
+    # - cron: "13 */6 * * *"        # runs itself automatically every 6 hours
 
 concurrency:
   group: github-metadata-pipeline
