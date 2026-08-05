@@ -1,53 +1,54 @@
 name: github-metadata-pipeline
-
 on:
   workflow_dispatch: {}          # manual "Run workflow" button, still available
   # schedule:
     # - cron: "13 */6 * * *"        # runs itself automatically every 6 hours
-
 concurrency:
   group: github-metadata-pipeline
   cancel-in-progress: false      # never kill a run that's mid-flight
-
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 355         # ~5h55m of work, leaves buffer before the 6h hard limit
-
     steps:
       - name: Checkout repo (script only, db is NOT in git)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: |
           pip install aiohttp python-dotenv requests huggingface_hub hf_xet pyarrow
-
       - name: Download latest db from HF bucket
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python download_db_bucket.py --bucket PERDYPTO/db_snapshot --file github_pipeline.db
-
       - name: Show starting status
         run: python percent.py status
-
-      # percent.py now does three things concurrently in this one command:
-      #  1) scrapes pending repo_ids (10 tokens, 3 concurrent req/token)
-      #  2) auto-ingests the next not-yet-ingested parquet part(s) in the
-      #     background, discovering the full part list itself, and reports
-      #     how many repo_ids were new vs already in the db per part
-      #  3) checkpoints the db to the HF bucket every 10 min, or sooner if
+      # ONE-TIME REPAIR STEP: the old ingest logic overwrote
+      # file_count_part per-part instead of accumulating it, which
+      # permanently and wrongly excluded large multi-part repos (e.g.
+      # OpenBB-finance/OpenBB) from ever being scraped by marking them
+      # 'skipped_filter'. This puts every skipped_filter row back into
+      # 'pending' so it gets a real GitHub API call. Safe to run every
+      # time -- once there are no more skipped_filter rows left (there
+      # won't be, since the fixed script no longer creates them), this
+      # step becomes a harmless no-op. You can delete this step entirely
+      # once you've confirmed `status` shows 0 skipped_filter rows.
+      - name: Resweep wrongly-filtered rows (one-time repair)
+        run: python percent.py resweep
+      # percent.py now does two things concurrently in this one command:
+      #  1) scrapes pending repo_ids (all tokens, 3 concurrent req/token)
+      #  2) checkpoints the db to the HF bucket every 10 min, or sooner if
       #     3+ tokens are simultaneously rate-limited
-      # Scraping keeps going until BOTH the queue is empty AND ingestion has
-      # confirmed there are no more parquet parts left anywhere.
-      - name: Run pipeline (self-checkpointing, self-ingesting)
+      # Auto-ingest is OFF: all 401 parquet parts are already ingested,
+      # so there's nothing left to discover/scan. Re-enable by removing
+      # --no-auto-ingest if new parquet parts ever get added upstream.
+      - name: Run pipeline (self-checkpointing)
         env:
           GITHUB_TOKENS: ${{ secrets.GH_TOKENS }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -57,11 +58,10 @@ jobs:
             --bucket PERDYPTO/db_snapshot \
             --checkpoint-interval 600 \
             --checkpoint-exhausted 3 \
+            --no-auto-ingest \
             || true
-
       - name: Show ending status
         run: python percent.py status
-
       # Belt-and-suspenders: one more explicit upload in case the in-process
       # final checkpoint didn't get to finish before the job was cut off.
       - name: Final safety-net upload
