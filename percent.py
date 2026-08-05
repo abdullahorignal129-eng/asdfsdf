@@ -32,6 +32,10 @@ Usage:
   # resume anytime, safe to Ctrl+C and rerun
   python scripts/github_pipeline_sqlite.py run
 
+  # one-off repair: undo the old per-part overwrite bug by putting every
+  # skipped_filter row back into pending (run this ONCE after upgrading)
+  python scripts/github_pipeline_sqlite.py resweep
+
   # stats
   python scripts/github_pipeline_sqlite.py status
 """
@@ -278,8 +282,20 @@ def _ingest_part_core(db: DB, part: int, min_files: int, max_files: int | None, 
     Core ingest logic for ONE parquet part. Scans it, inserts any repo_ids
     not already in repo_ids (existing rows are left completely untouched --
     their status/progress is never reset), reports how many were new vs
-    already present, immediately applies the min/max file-count filter to
-    the newly inserted rows, and records the outcome in parquet_progress.
+    already present, and records the outcome in parquet_progress.
+
+    IMPORTANT: file_count_part / bytes_part are ACCUMULATED across parts,
+    not overwritten. A single repo's Python files are frequently split
+    across many of the 401 parquet parts -- each part only sees a slice.
+    The old code overwrote these columns on every re-ingest, so a repo's
+    scrape-eligibility depended entirely on whichever part happened to be
+    ingested last, which wrongly excluded large multi-part repos (e.g.
+    OpenBB-finance/OpenBB) from the min/max file-count filter. We also no
+    longer apply the destructive 'skipped_filter' status here -- that
+    filtering now happens live at claim time in claim_batch(), against
+    accumulated (correct) totals, so nothing is ever permanently excluded
+    based on a partial mid-ingestion snapshot.
+
     Reusable by both the CLI `ingest` command and the background
     auto-ingest worker that runs alongside scraping.
     """
@@ -321,7 +337,8 @@ def _ingest_part_core(db: DB, part: int, min_files: int, max_files: int | None, 
     already_count = len(already_present_ids)
 
     # INSERT OR IGNORE -> existing rows (and their status/progress) are
-    # never touched or reset by re-ingesting a part.
+    # never touched or reset by re-ingesting a part. Brand-new rows get
+    # this part's counts as their starting totals.
     db.executemany(
         """
         INSERT OR IGNORE INTO repo_ids
@@ -330,28 +347,25 @@ def _ingest_part_core(db: DB, part: int, min_files: int, max_files: int | None, 
         """,
         [(rid, fc, b, "pending", None, now()) for rid, (fc, b) in counts.items()],
     )
-    # Keep file_count_part/bytes_part current even for ids that already
-    # existed (harmless -- status/progress fields are untouched by this).
-    db.executemany(
-        """
-        UPDATE repo_ids
-        SET file_count_part = ?, bytes_part = ?, updated_at = ?
-        WHERE repo_id = ?
-        """,
-        [(fc, b, now(), rid) for rid, (fc, b) in counts.items()],
-    )
 
-    # Apply the min/max file-count filter immediately so newly ingested
-    # rows don't sit around eligible for scraping outside the range.
-    db.execute(
-        "UPDATE repo_ids SET status='skipped_filter', updated_at=? WHERE status='pending' AND file_count_part < ?",
-        (now(), min_files),
-    )
-    if max_files is not None:
-        db.execute(
-            "UPDATE repo_ids SET status='skipped_filter', updated_at=? WHERE status='pending' AND file_count_part > ?",
-            (now(), max_files),
+    # ACCUMULATE (add, don't overwrite) for rows that already existed
+    # before this part -- this is the core fix. Only apply the delta to
+    # rows NOT just inserted above, so we don't double-count.
+    existing_this_part = [rid for rid in counts if rid in already_present_ids]
+    if existing_this_part:
+        db.executemany(
+            """
+            UPDATE repo_ids
+            SET file_count_part = file_count_part + ?,
+                bytes_part = bytes_part + ?,
+                updated_at = ?
+            WHERE repo_id = ?
+            """,
+            [(counts[rid][0], counts[rid][1], now(), rid) for rid in existing_this_part],
         )
+
+    # NOTE: no min/max filter sweep here anymore (see docstring above).
+    # claim_batch() enforces the filter live at claim time instead.
 
     db.execute(
         """
@@ -914,26 +928,19 @@ async def ingest_worker(
     ingest_done_event.set()
 
 
-
-
 async def run_async(args, tokens: list[str]):
     db = DB(args.db)
 
-    if args.max_files is not None:
-        db.execute(
-            """
-            UPDATE repo_ids SET status='skipped_filter', updated_at=?
-            WHERE status='pending' AND file_count_part > ?
-            """,
-            (now(), args.max_files),
-        )
-    db.execute(
-        """
-        UPDATE repo_ids SET status='skipped_filter', updated_at=?
-        WHERE status='pending' AND file_count_part < ?
-        """,
-        (now(), args.min_files),
-    )
+    # NOTE: the old destructive 'skipped_filter' sweep that ran here on
+    # every startup has been REMOVED. It was re-applying the min/max
+    # filter against whatever file_count_part happened to be at that
+    # moment, which -- combined with the old per-part overwrite bug --
+    # permanently exiled large multi-part repos from ever being scraped.
+    # The filter is now enforced live at claim time in claim_batch(),
+    # against accumulated (correct) totals, so nothing gets stuck.
+    # If you're upgrading from a DB that already has rows stuck in
+    # 'skipped_filter' from before this fix, run `resweep` once.
+
     # Recover stuck in_progress rows from a previous crashed/interrupted run.
     # Nothing else changes -> your current 'done'/'error'/'metadata'/'forks'
     # rows are untouched and the run resumes from where it stopped.
@@ -1047,6 +1054,35 @@ def cmd_status(args):
         )
 
 
+def cmd_resweep(args):
+    """
+    ONE-OFF REPAIR COMMAND. Run this exactly once after upgrading to this
+    version of the script, on your existing DB.
+
+    Background: the old ingest logic OVERWROTE file_count_part/bytes_part
+    on every part re-ingest instead of accumulating them, and then
+    immediately re-applied the min/max filter, permanently marking rows
+    'skipped_filter' based on a partial, single-part snapshot. Repos whose
+    Python files span many parquet parts (large real-world projects like
+    OpenBB-finance/OpenBB) got wrongly and permanently excluded depending
+    on which part happened to be ingested last.
+
+    Since ingestion is retroactively unfixable without a full parquet
+    rescan (the old overwritten totals are already lost), the practical
+    fix is: stop trusting file_count_part as gospel, and just let
+    everything currently stuck in skipped_filter get a real shot via a
+    GitHub API call again. This puts all skipped_filter rows back to
+    pending so they re-enter the scrape queue.
+    """
+    db = DB(args.db)
+    before = db.query_one("SELECT COUNT(*) AS c FROM repo_ids WHERE status='skipped_filter'")["c"]
+    db.execute("UPDATE repo_ids SET status='pending', updated_at=? WHERE status='skipped_filter'", (now(),))
+    after_pending = db.query_one("SELECT COUNT(*) AS c FROM repo_ids WHERE status='pending'")["c"]
+    print(f"[resweep] moved {before:,} rows from skipped_filter -> pending")
+    print(f"[resweep] total pending now: {after_pending:,}")
+    print("[resweep] done. Run `run` to start scraping the recovered rows.")
+
+
 def cmd_export(args):
     """Optional: dump metadata to JSON for the rest of the pipeline."""
     db = DB(args.db)
@@ -1106,6 +1142,11 @@ def main():
 
     sub.add_parser("status")
 
+    sub.add_parser(
+        "resweep",
+        help="ONE-OFF: move all skipped_filter rows back to pending (run once after upgrading)."
+    )
+
     p_exp = sub.add_parser("export")
     p_exp.add_argument("--out", default="repo_metadata.json")
 
@@ -1118,6 +1159,8 @@ def main():
         cmd_run(args)
     elif args.cmd == "status":
         cmd_status(args)
+    elif args.cmd == "resweep":
+        cmd_resweep(args)
     elif args.cmd == "export":
         cmd_export(args)
 
