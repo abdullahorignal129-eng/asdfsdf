@@ -1,0 +1,31 @@
+name: Analyze SQLite Database
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install huggingface_hub
+
+      - name: Download database
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python download_db_bucket.py \
+            --bucket PERDYPTO/db_snapshot \
+            --file github_pipeline.db
+
+      - name: Analyze database
+        run: |
+          python scripts/analyze_sqlite.py
